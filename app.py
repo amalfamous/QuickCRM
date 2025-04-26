@@ -3,6 +3,9 @@ import sqlite3
 import hashlib
 import yagmail
 import os
+import logging
+from PIL import Image
+
 try:
     EMAIL_USER = st.secrets["EMAIL_USER"]
     EMAIL_PASS = st.secrets["EMAIL_PASS"]
@@ -14,7 +17,17 @@ if not EMAIL_USER or not EMAIL_PASS:
     st.error("Les identifiants email ne sont pas configurés. Vérifiez vos secrets ou variables d'environnement.")
     st.stop()
 
-yag = yagmail.SMTP(EMAIL_USER, EMAIL_PASS)
+# Active le logging SMTP pour diagnostiquer les échanges
+logging.basicConfig(level=logging.DEBUG)
+
+yag = yagmail.SMTP(
+    user=EMAIL_USER,
+    password=EMAIL_PASS,
+    host="smtp.gmail.com",    # ou votre SMTP provider
+    port=587,                 # 587 pour STARTTLS, 465 pour SSL
+    smtp_starttls=True,       # requiert STARTTLS
+    smtp_ssl=False            # SSL désactivé (on utilise STARTTLS)
+)
 
 def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
@@ -33,9 +46,20 @@ def send_email(to: str, subject: str, html: str) -> bool:
         st.error(f"Erreur email: {e}")
         return False
 
-# --- DB Connection ---
-conn = sqlite3.connect('sales.db', check_same_thread=False)
+# --- DB Connection (autocommit + WAL pour éviter les verrous) ---
+conn = sqlite3.connect(
+    'sales.db',
+    check_same_thread=False,
+    isolation_level=None,   # passe en mode autocommit
+    timeout=30              # attend jusqu’à 30s si la DB est temporairement verrouillée
+)
 c = conn.cursor()
+
+# Active le journal WAL (permet lecteurs + écrivains concurrents)
+c.execute("PRAGMA journal_mode=WAL;")
+# Optionnel : configure un délai d’attente interne
+c.execute("PRAGMA busy_timeout = 30000;")  # en ms, ici 30s
+
 
 tables = [
     ("users", "id INTEGER PRIMARY KEY, username TEXT UNIQUE, email TEXT UNIQUE, password TEXT, role TEXT"),
@@ -54,7 +78,15 @@ if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 
 if not st.session_state.logged_in:
+    st.set_page_config(
+    page_title="Quick CRM",
+    page_icon="mon_logo.jpeg",  
+    layout="centered",
+    initial_sidebar_state="collapsed"
+)
+
     st.title(" Authentification")
+ 
     login_tab, register_tab = st.tabs(["Se connecter", "S'inscrire"])
 
     with login_tab:
@@ -123,49 +155,75 @@ else:
 if role == 'sales':
     with tabs[0]:
         st.header("Produits")
-        nom = st.text_input("Nom du produit", key="prod_nom")
+
+        # Formulaire d'ajout
+        nom  = st.text_input("Nom du produit", key="prod_nom")
         prix = st.number_input("Prix (€)", min_value=0.0, key="prod_prix")
         if st.button("Ajouter Produit", key="add_prod"):
             c.execute("INSERT INTO produits (nom,prix) VALUES (?,?)", (nom, prix))
             conn.commit()
             st.success("Produit ajouté !")
+
         st.markdown("---")
+
+        # Initialisation du flag d'édition
+        if "editing_product" not in st.session_state:
+            st.session_state.editing_product = None
+
+        # Liste & édition des produits
         for pid, name, pr in c.execute("SELECT * FROM produits"):
             cols = st.columns([3,1,1])
             cols[0].write(f"{pid}. {name} — {pr}€")
             if cols[1].button("Modifier", key=f"modp{pid}"):
-                up_name = st.text_input("Nom", value=name, key=f"np{pid}")
-                up_price = st.number_input("Prix (€)", value=pr, key=f"pp{pid}")
-                if st.button("Valider Modif", key=f"cfp{pid}"):
-                    c.execute(
-                        "UPDATE produits SET nom=?,prix=? WHERE id=?",
-                        (up_name, up_price, pid)
-                    )
-                    conn.commit()
-                    st.rerun()
+                st.session_state.editing_product = pid
+                st.rerun()
             if cols[2].button("Supprimer", key=f"delp{pid}"):
                 c.execute("DELETE FROM produits WHERE id=?", (pid,))
                 conn.commit()
                 st.rerun()
 
+            # Formulaire en ligne pour le produit en cours d'édition
+            if st.session_state.editing_product == pid:
+                up_name  = st.text_input("Nouveau nom", value=name, key=f"np_edit{pid}")
+                up_price = st.number_input("Nouveau prix (€)", value=pr, key=f"pp_edit{pid}")
+                cols_edit = st.columns(2)
+                if cols_edit[0].button("Valider", key=f"save_edit{pid}"):
+                    c.execute(
+                        "UPDATE produits SET nom=?, prix=? WHERE id=?",
+                        (up_name, up_price, pid)
+                    )
+                    conn.commit()
+                    st.session_state.editing_product = None
+                    st.rerun()
+                if cols_edit[1].button("Annuler", key=f"cancel_edit{pid}"):
+                    st.session_state.editing_product = None
+                    st.rerun()
+
+
 # --- Sales: Clients ---
 if role == 'sales':
     with tabs[1]:
         st.header("Clients")
-        cname = st.text_input("Nom du client", key="cli_nom")
-        cemail = st.text_input("Email du client", key="cli_email")
+
+        # Formulaire d'ajout
+        cname  = st.text_input("Nom du client", key="add_cli_nom")
+        cemail = st.text_input("Email du client", key="add_cli_email")
         if st.button("Ajouter Client", key="add_cli"):
             c.execute("INSERT INTO clients (nom,email) VALUES (?,?)", (cname, cemail))
             conn.commit()
             st.success("Client ajouté !")
+
         st.markdown("---")
+
+        # Liste des clients existants
         for cid, nm, mail in c.execute("SELECT * FROM clients"):
-            cols = st.columns([3,1,1])
+            cols = st.columns([3, 1])
             cols[0].write(f"{cid}. {nm} — {mail}")
             if cols[1].button("Supprimer", key=f"delc{cid}"):
                 c.execute("DELETE FROM clients WHERE id=?", (cid,))
                 conn.commit()
                 st.rerun()
+
 
 # --- Sales: Devis ---
 if role == 'sales':
@@ -220,25 +278,56 @@ if role == 'sales':
             conn.commit()
             st.success(f"Devis #{did_conf} confirmé !")
             # on vide les query params pour éviter de réafficher ce message
-            st.experimental_set_query_params()
+            st.set_query_params()
 
 
 # --- Sales: Bon de Commande ---
 if role == 'sales':
     with tabs[3]:
         st.header("Bon de Commande")
-        for bdc_id, devis_id, statut in c.execute("SELECT * FROM bon_commandes"):
-            prod, qte = c.execute(
-                "SELECT produit_id,quantite FROM devis WHERE id=?", (devis_id,)
-            ).fetchone()
-            pname = c.execute(
-                "SELECT nom FROM produits WHERE id=?", (prod,)
-            ).fetchone()[0]
-            st.write(f"#{bdc_id} – Devis {devis_id} ({pname}×{qte}) => **{statut}**")
-            if statut == 'En attente' and st.button(f"Marquer comme Reçu", key=f"rcv_bdc{bdc_id}"):
-                c.execute("UPDATE bon_commandes SET statut='Reçu' WHERE id=?", (bdc_id,))
-                conn.commit()
-                st.rerun()
+
+        # Récupère toutes les commandes
+        bdc_rows = c.execute(
+            "SELECT id, devis_id, statut FROM bon_commandes"
+        ).fetchall()
+
+        if not bdc_rows:
+            st.info("Aucun bon de commande pour le moment.")
+        else:
+            for bdc_id, devis_id, statut in bdc_rows:
+                # 1) Récupérer la ligne de devis
+                d = c.execute(
+                    "SELECT produit_id, quantite FROM devis WHERE id=?", 
+                    (devis_id,)
+                ).fetchone()
+                if d is None:
+                    st.error(f"❌ Devis #{devis_id} introuvable pour BDC #{bdc_id}.")
+                    continue
+                prod_id, qte = d
+
+                # 2) Récupérer le nom du produit
+                p = c.execute(
+                    "SELECT nom FROM produits WHERE id=?", 
+                    (prod_id,)
+                ).fetchone()
+                if p is None:
+                    st.error(f"❌ Produit #{prod_id} introuvable pour BDC #{bdc_id}.")
+                    continue
+                pname = p[0]
+
+                # 3) Affichage et bouton
+                st.write(f"#{bdc_id} – Devis {devis_id} ({pname}×{qte}) => **{statut}**")
+                if statut == 'En attente' and st.button(
+                    "Marquer comme Reçu", key=f"rcv_bdc{bdc_id}"
+                ):
+                    c.execute(
+                        "UPDATE bon_commandes SET statut='Reçu' WHERE id=?", 
+                        (bdc_id,)
+                    )
+                    conn.commit()
+                    st.success(f"BDC #{bdc_id} marqué comme “Reçu”.")
+                    st.rerun()
+
 
 
 # --- Sales: Factures ---
@@ -295,53 +384,142 @@ if role == 'sales':
             )
             conn.commit()
             st.success(f"Facture #{fid_pay} payée ! Bon de livraison généré.")
-            st.experimental_set_query_params()
+            st.set_query_params()
 
 # --- Delivery: Livraisons ---
 if role == 'delivery':
     with tabs[0]:
         st.header("Livraisons")
-        for lid, fid_l, stt in c.execute("SELECT * FROM livraisons"):
-            st.write(f"{lid}. facture#{fid_l} => **{stt}**")
-            if stt != 'Livré' and st.button(f"Confirmer Livraison", key=f"deliv{lid}"):
-                c.execute("UPDATE livraisons SET statut='Livré' WHERE id=?", (lid,))
-                conn.commit()
-                st.rerun()
+
+        # Récupère toutes les livraisons
+        rows = c.execute(
+            "SELECT id, facture_id, statut FROM livraisons"
+        ).fetchall()
+
+        # Message si aucune livraison
+        if not rows:
+            st.info("Aucune livraison à traiter pour le moment.")
+        else:
+            # Affiche chaque livraison et bouton de confirmation
+            for lid, fid_l, stt in rows:
+                st.write(f"{lid}. facture#{fid_l} => **{stt}**")
+                if stt != 'Livré' and st.button(
+                    "Confirmer Livraison", key=f"deliv{lid}"
+                ):
+                    c.execute(
+                        "UPDATE livraisons SET statut='Livré' WHERE id=?", (lid,)
+                    )
+                    conn.commit()
+                    st.success(f"Livraison #{lid} marquée comme livrée.")
+                    st.rerun()
+
 
 # --- Client: Mes Devis, Mes BDC, Mes Factures ---
 if role == 'client':
-    cid = c.execute("SELECT id FROM clients WHERE email=?", (st.session_state.email,)).fetchone()[0]
+    # 0) Récupérer et valider l'ID du client
+    row = c.execute(
+        "SELECT id FROM clients WHERE email=?", 
+        (st.session_state.email,)
+    ).fetchone()
+    if row is None:
+        st.error("Client introuvable.")
+        st.stop()
+    cid = row[0]
 
+    # ---- Onglet 1 : Mes Devis ----
     with tabs[0]:
         st.header("Mes Devis")
-        for did, _, pid_c, q_c, stt_c in c.execute("SELECT * FROM devis WHERE client_id=?", (cid,)):
-            pname_c = c.execute("SELECT nom FROM produits WHERE id=?", (pid_c,)).fetchone()[0]
-            st.write(f"{did}. {pname_c}×{q_c} => **{stt_c}**")
-            if stt_c == 'En attente' and st.button(f"Confirmer Devis", key=f"conf{did}"):
-                c.execute("UPDATE devis SET statut='Confirmé' WHERE id=?", (did,))
-                conn.commit()
-                st.rerun()
+        devis_rows = c.execute(
+            "SELECT id, produit_id, quantite, statut "
+            "FROM devis WHERE client_id=?", 
+            (cid,)
+        ).fetchall()
 
+        if not devis_rows:
+            st.info("Vous n'avez aucun devis pour le moment.")
+        else:
+            for did, pid_c, q_c, stt_c in devis_rows:
+                # Protection contre produit supprimé
+                prod_row = c.execute(
+                    "SELECT nom FROM produits WHERE id=?", 
+                    (pid_c,)
+                ).fetchone()
+                if prod_row is None:
+                    pname_c = "<Produit introuvable>"
+                else:
+                    pname_c = prod_row[0]
+
+                st.write(f"{did}. {pname_c} × {q_c} => **{stt_c}**")
+
+                if stt_c == 'En attente' and st.button(
+                    f"Confirmer Devis #{did}", key=f"conf{did}"
+                ):
+                    c.execute(
+                        "UPDATE devis SET statut='Confirmé' WHERE id=?", 
+                        (did,)
+                    )
+                    conn.commit()
+                    st.success(f"Devis #{did} confirmé.")
+                    st.rerun()
+
+    # ---- Onglet 2 : Mes Bon de Commande ----
     with tabs[1]:
         st.header("Mes Bon de Commande")
-        devis_conf = [d[0] for d in c.execute("SELECT id FROM devis WHERE client_id=? AND statut='Confirmé'", (cid,))]
-        for did_b in devis_conf:
-            exists = c.execute("SELECT 1 FROM bon_commandes WHERE devis_id=?", (did_b,)).fetchone()
-            if not exists and st.button(f"Créer & Envoyer BDC #{did_b}", key=f"bdc{did_b}"):
-                c.execute("INSERT INTO bon_commandes (devis_id,statut) VALUES (?, 'En attente')", (did_b,))
-                conn.commit()
-                sales_emails = [r[0] for r in c.execute("SELECT email FROM users WHERE role='sales'")]
-                html = f"<p>Bon de commande pour devis #{did_b} envoyé.</p>"
-                for mail in sales_emails:
-                    send_email(mail, "Nouveau Bon de Commande", html)
-                st.success(f"BDC #{did_b} envoyé !")
-            elif exists:
-                bdc = c.execute("SELECT id, statut FROM bon_commandes WHERE devis_id=?", (did_b,)).fetchone()
-                st.write(f"#{bdc[0]} pour Devis {did_b} => **{bdc[1]}**")
+        devis_conf = c.execute(
+            "SELECT id FROM devis WHERE client_id=? AND statut='Confirmé'", 
+            (cid,)
+        ).fetchall()
 
+        if not devis_conf:
+            st.info("Aucun devis confirmé, donc pas de bon de commande.")
+        else:
+            for (did_b,) in devis_conf:
+                # On cherche s'il existe déjà un BDC pour ce devis
+                bdc_row = c.execute(
+                    "SELECT id, statut FROM bon_commandes WHERE devis_id=?", 
+                    (did_b,)
+                ).fetchone()
+
+                if bdc_row is None:
+                    if st.button(
+                        f"Créer & Envoyer BDC #{did_b}", 
+                        key=f"bdc{did_b}"
+                    ):
+                        c.execute(
+                            "INSERT INTO bon_commandes (devis_id,statut) "
+                            "VALUES (?, 'En attente')",
+                            (did_b,)
+                        )
+                        conn.commit()
+                        # On notifie toutes les sales
+                        sales_emails = [
+                            r[0] for r in c.execute(
+                                "SELECT email FROM users WHERE role='sales'"
+                            )
+                        ]
+                        html = f"<p>Bon de commande pour devis #{did_b} envoyé.</p>"
+                        for mail in sales_emails:
+                            send_email(mail, "Nouveau Bon de Commande", html)
+                        st.success(f"BDC #{did_b} envoyé !")
+                else:
+                    bdc_id, bdc_statut = bdc_row
+                    st.write(f"#{bdc_id} pour Devis {did_b} => **{bdc_statut}**")
+
+    # ---- Onglet 3 : Mes Factures ----
     with tabs[2]:
         st.header("Mes Factures")
-        for fid_c, did_fi, amt_c, stt_f in c.execute("SELECT * FROM factures WHERE devis_id IN (SELECT id FROM devis WHERE client_id=?)", (cid,)):
-            st.write(f"{fid_c}. devis#{did_fi} – {amt_c}€ => **{stt_f}**")
+        fact_rows = c.execute(
+            "SELECT id, devis_id, montant, statut "
+            "FROM factures WHERE devis_id IN "
+            "(SELECT id FROM devis WHERE client_id=?)",
+            (cid,)
+        ).fetchall()
+
+        if not fact_rows:
+            st.info("Aucune facture pour le moment.")
+        else:
+            for fid_c, did_fi, amt_c, stt_f in fact_rows:
+                st.write(f"{fid_c}. devis#{did_fi} – {amt_c}€ => **{stt_f}**")
+
 
 conn.close()
