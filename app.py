@@ -3,8 +3,6 @@ import sqlite3
 import hashlib
 import yagmail
 import os
-
-# --- Configuration Email (Secrets Streamlit or ENV) ---
 try:
     EMAIL_USER = st.secrets["EMAIL_USER"]
     EMAIL_PASS = st.secrets["EMAIL_PASS"]
@@ -18,7 +16,6 @@ if not EMAIL_USER or not EMAIL_PASS:
 
 yag = yagmail.SMTP(EMAIL_USER, EMAIL_PASS)
 
-# --- Helper functions ---
 def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
@@ -40,7 +37,6 @@ def send_email(to: str, subject: str, html: str) -> bool:
 conn = sqlite3.connect('sales.db', check_same_thread=False)
 c = conn.cursor()
 
-# --- Create tables ---
 tables = [
     ("users", "id INTEGER PRIMARY KEY, username TEXT UNIQUE, email TEXT UNIQUE, password TEXT, role TEXT"),
     ("produits", "id INTEGER PRIMARY KEY, nom TEXT, prix REAL"),
@@ -54,12 +50,11 @@ for name, schema in tables:
     c.execute(f"CREATE TABLE IF NOT EXISTS {name} ({schema})")
 conn.commit()
 
-# --- Authentication ---
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 
 if not st.session_state.logged_in:
-    st.title("🔒 Authentification")
+    st.title(" Authentification")
     login_tab, register_tab = st.tabs(["Se connecter", "S'inscrire"])
 
     with login_tab:
